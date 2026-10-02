@@ -22,6 +22,9 @@ frontend/dist-ssr/
 *.tsbuildinfo
 coverage/
 
+# Local design docs (not published with the repo)
+docs/
+
 # IDE / editor / Cursor
 .idea/
 .vscode/
