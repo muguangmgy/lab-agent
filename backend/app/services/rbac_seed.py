@@ -1,7 +1,5 @@
 """RBAC 幂等种子数据（角色 / 菜单 / 绑定）。不含旧 users.role 列迁移。"""
 
-from sqlalchemy.orm import Session
-
 from app.database import SessionLocal
 from app.models.menu import Menu
 from app.models.role import Role

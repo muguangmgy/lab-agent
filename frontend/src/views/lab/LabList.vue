@@ -62,7 +62,6 @@
 import { ref, reactive, onMounted } from 'vue'
 import { getLabPageList } from '@/api/lab'
 import { Search } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
 import router from '@/router'
 import ReserveDialog from '@/components/ReserveDialog.vue'
 

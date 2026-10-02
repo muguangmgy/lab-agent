@@ -69,7 +69,7 @@
 <script setup>
 import { getLab } from '@/api/lab'
 import { ElMessage } from 'element-plus'
-import { ref, reactive, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getEquipmentPageList } from '@/api/equipment'
 import ReserveDialog from '@/components/ReserveDialog.vue'
