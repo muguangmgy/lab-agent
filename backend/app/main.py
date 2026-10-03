@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import UPLOAD_DIR, settings
 from app.services import kb_service, reservation_service
 from app.services.agent import checkpointer as agent_checkpointer
+from app.services.rbac_seed import seed_rbac
 
 # 显式 import 全部模型，保证 create_all 建出 roles/menus/关联表
 import app.models  # noqa: F401
@@ -36,7 +37,12 @@ origins = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动时预热向量库/初始化 Redis，并跑预约过期扫描。"""
+    """启动时播种 RBAC/预热向量库/初始化 Redis，并跑预约过期扫描。"""
+    # 幂等写入角色/菜单/绑定，保证空库可注册、侧栏有菜单
+    try:
+        await asyncio.to_thread(seed_rbac)
+    except Exception:
+        logger.exception("RBAC 种子写入失败，服务继续启动")
     # 预热向量库：模型加载（约 15s）挪到启动阶段，避免首个请求超过前端 30s 超时
     try:
         await asyncio.to_thread(kb_service.warmup)
