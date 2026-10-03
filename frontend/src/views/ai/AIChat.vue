@@ -26,12 +26,20 @@
                     <div class="session-title">{{ item.title || '新对话' }}</div>
                     <div class="session-meta">
                         <span>{{ formatTime(item.update_time || item.create_time) }}</span>
-                        <button type="button" class="session-delete" :disabled="loading" title="删除"
-                            @click.stop="handleDeleteSession(item)">
-                            <el-icon>
-                                <Delete />
-                            </el-icon>
-                        </button>
+                        <div class="session-actions">
+                            <button type="button" class="session-action" :disabled="loading" title="重命名"
+                                @click.stop="handleRenameSession(item)">
+                                <el-icon>
+                                    <EditPen />
+                                </el-icon>
+                            </button>
+                            <button type="button" class="session-action is-danger" :disabled="loading" title="删除"
+                                @click.stop="handleDeleteSession(item)">
+                                <el-icon>
+                                    <Delete />
+                                </el-icon>
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -78,11 +86,12 @@ import {
     chatApi,
     listSessionsApi,
     getSessionMessagesApi,
-    deleteSessionApi
+    deleteSessionApi,
+    updateSessionApi
 } from '@/api/ai'
 import { ref, nextTick, onMounted, computed } from 'vue'
-import { ElMessageBox } from 'element-plus'
-import { Delete, ChatDotRound, Top, Loading } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Delete, EditPen, ChatDotRound, Top, Loading } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 
@@ -166,6 +175,34 @@ const handleSelectSession = async (item) => {
         }
     } finally {
         if (token === loadToken) loading.value = false
+    }
+}
+
+/** 弹窗修改会话标题 */
+const handleRenameSession = async (item) => {
+    if (loading.value || !item?.thread_id) return
+    let title
+    try {
+        const { value } = await ElMessageBox.prompt('请输入新的会话名称', '重命名', {
+            confirmButtonText: '确定',
+            cancelButtonText: '取消',
+            inputValue: item.title || '新对话',
+            inputValidator: (val) => {
+                const t = (val || '').trim()
+                if (!t) return '标题不能为空'
+                if (t.length > 100) return '标题最多 100 字'
+                return true
+            }
+        })
+        title = (value || '').trim()
+    } catch {
+        return
+    }
+    if (!title || title === (item.title || '').trim()) return
+    const res = await updateSessionApi(item.thread_id, { title })
+    if (res.code === 200) {
+        ElMessage.success('已重命名')
+        await refreshSessions()
     }
 }
 
@@ -383,8 +420,20 @@ onMounted(async () => {
     color: var(--chat-muted);
 }
 
-.session-delete {
+.session-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
     opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.session-item:hover .session-actions,
+.session-item.active .session-actions {
+    opacity: 1;
+}
+
+.session-action {
     border: none;
     background: transparent;
     color: #a8b0bd;
@@ -393,20 +442,20 @@ onMounted(async () => {
     border-radius: 4px;
     display: inline-flex;
     align-items: center;
-    transition: opacity 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+    transition: color 0.15s ease, background-color 0.15s ease;
 }
 
-.session-item:hover .session-delete,
-.session-item.active .session-delete {
-    opacity: 1;
+.session-action:hover:not(:disabled) {
+    color: var(--chat-primary);
+    background: color-mix(in srgb, var(--chat-primary) 10%, transparent);
 }
 
-.session-delete:hover:not(:disabled) {
+.session-action.is-danger:hover:not(:disabled) {
     color: #f56c6c;
     background: rgba(245, 108, 108, 0.08);
 }
 
-.session-delete:disabled {
+.session-action:disabled {
     cursor: not-allowed;
 }
 
