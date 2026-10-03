@@ -101,7 +101,10 @@ def touch_session(
         session.title = title_from_user.strip()[:20]
     if commit:
         db.commit()
-        db.refresh(session)
+        try:
+            db.refresh(session)
+        except Exception:
+            pass
 
 
 def add_message(

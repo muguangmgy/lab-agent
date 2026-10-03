@@ -1,6 +1,12 @@
 from langchain_openai import ChatOpenAI
 from sqlalchemy.orm import Session
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
+from langchain_core.messages import (
+    HumanMessage,
+    SystemMessage,
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+)
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
@@ -44,9 +50,16 @@ def build_agent(db: Session, current_user: User, last_user_text: str = ""):
     ).bind_tools(tools)
 
     def agent_node(state: MessagesState):
-        """langGraph 执行的工作流 的节点"""
-        response = llm.invoke(state["messages"])
-        return {"messages": [response]}
+        """Agent 节点：用 llm.stream 聚合，既出 token 又得到带 tool_calls 的完整消息。
+
+        stream_mode=messages 依赖可流式的模型调用；最后仍返回一条消息给 tools_condition。
+        """
+        merged = None
+        for chunk in llm.stream(state["messages"]):
+            merged = chunk if merged is None else merged + chunk
+        if merged is None:
+            raise BusinessException(message="大模型没有任何返回内容")
+        return {"messages": [merged]}
 
     graph = StateGraph(MessagesState)
     graph.add_node("agent", agent_node)  # 调用大模型的节点
@@ -74,22 +87,150 @@ def _prior_to_langchain(prior_messages: list) -> list[BaseMessage]:
     return history
 
 
+def _content_to_text(content) -> str:
+    """把 AI content（str 或多模态 list）收成可见纯文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(str(part.get("text") or ""))
+            else:
+                text = getattr(part, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
 def _extract_assistant_text(messages: list) -> str:
     """从图执行结果中取最后一条非空 AI 文本回复。"""
     if not messages:
         raise BusinessException(message="大模型没有任何返回内容")
     for message in reversed(messages):
         if isinstance(message, AIMessage) and message.content:
-            content = message.content
-            if isinstance(content, list):
-                content = "".join(
-                    part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in content
-                )
-            content = str(content).strip()
+            content = _content_to_text(message.content).strip()
             if content:
                 return content
     raise BusinessException(message="大模型没有任何返回内容")
+
+
+def visible_assistant_delta(chunk) -> str:
+    """SSE 只推用户可见 assistant 文本增量。
+
+    过滤 ToolMessage、完整 AIMessage、以及只有 tool_calls 没有正文的块（工具回合不上屏）。
+    """
+    if not isinstance(chunk, AIMessageChunk):
+        return ""
+    text = _content_to_text(chunk.content)
+    tool_calls = getattr(chunk, "tool_calls", None) or []
+    tool_call_chunks = getattr(chunk, "tool_call_chunks", None) or []
+    extra = getattr(chunk, "additional_kwargs", None) or {}
+    has_tools = bool(tool_calls or tool_call_chunks or extra.get("tool_calls"))
+    if has_tools and not text.strip():
+        return ""
+    return text
+
+
+def build_input_messages(
+    *,
+    has_checkpoint: bool,
+    last_user_text: str,
+    prior_messages: list | None,
+) -> list[BaseMessage]:
+    """stream_agent / run_agent 共用输入：有 Redis 则暖启动只追加 Human，否则冷启动带 System+prior。"""
+    text = (last_user_text or "").strip()
+    if has_checkpoint:
+        return [HumanMessage(content=text)]
+    prior = _prior_to_langchain(prior_messages or [])
+    return [
+        SystemMessage(content=SYSTEM_PROMPT),
+        *prior,
+        HumanMessage(content=text),
+    ]
+
+
+def human_already_in_checkpoint(messages: list, last_user_text: str) -> bool:
+    """SSE 降级用：stream 可能已把本轮 Human 写入 Redis，invoke 时不能再追加同一句。"""
+    text = (last_user_text or "").strip()
+    for message in reversed(messages or []):
+        if isinstance(message, HumanMessage):
+            return (message.content or "").strip() == text
+    return False
+
+
+def final_assistant_from_state(messages: list) -> str | None:
+    """若图已停在无 tool_calls 的最终 AI，直接抽出全文。"""
+    if not messages:
+        return None
+    last = messages[-1]
+    if isinstance(last, AIMessageChunk) or not isinstance(last, AIMessage):
+        return None
+    if getattr(last, "tool_calls", None):
+        return None
+    try:
+        return _extract_assistant_text([last])
+    except BusinessException:
+        return None
+
+
+def map_agent_exception(exc: Exception) -> BusinessException:
+    """run_agent 与 SSE error 共用：Redis 不可用 / 模型失败转成固定中文文案。"""
+    if isinstance(exc, BusinessException):
+        return exc
+    name = type(exc).__module__ + "." + type(exc).__name__
+    if "redis" in name.lower() or "Redis" in type(exc).__name__:
+        return BusinessException(message=_REDIS_UNAVAILABLE)
+    return BusinessException(message="大模型调用失败，请稍后重试")
+
+
+def _graph_config(thread_id: str) -> dict:
+    return {
+        "configurable": {"thread_id": str(thread_id).strip()},
+        "recursion_limit": 10,
+    }
+
+
+def _validate_run_args(thread_id: str, last_user_text: str) -> str:
+    text = (last_user_text or "").strip()
+    if not text:
+        raise BusinessException(message="请输入您要对话的内容")
+    if not thread_id or not str(thread_id).strip():
+        raise BusinessException(message="会话无效")
+    return text
+
+
+def _load_checkpoint_messages(agent, config) -> list:
+    try:
+        state = agent.get_state(config)
+        return list((state.values or {}).get("messages") or [])
+    except BusinessException:
+        raise
+    except Exception:
+        raise BusinessException(message=_REDIS_UNAVAILABLE)
+
+
+def _invoke_graph(agent, payload, config):
+    try:
+        return agent.invoke(payload, config=config)
+    except BusinessException:
+        raise
+    except Exception as exc:
+        raise map_agent_exception(exc)
+
+
+def _resume_without_new_human(agent, config, existing: list) -> str:
+    """SSE 未吐字降级：checkpoint 已有本轮 Human 时，抽最终 AI 或空 messages 续跑。"""
+    done = final_assistant_from_state(existing)
+    if done:
+        return done
+    result = _invoke_graph(agent, {"messages": []}, config)
+    return _extract_assistant_text((result or {}).get("messages") or [])
 
 
 def run_agent(
@@ -99,47 +240,75 @@ def run_agent(
     thread_id: str,
     last_user_text: str,
     prior_messages: list | None = None,
+    resume_without_duplicate_human: bool = False,
 ) -> str:
-    """多轮对话：有 Redis checkpoint 只追加本轮 Human；否则 MySQL 冷启动。"""
-    text = (last_user_text or "").strip()
-    if not text:
-        raise BusinessException(message="请输入您要对话的内容")
-    if not thread_id or not str(thread_id).strip():
-        raise BusinessException(message="会话无效")
+    """非流式 /chat 以及 SSE 同连接降级：invoke 整图，返回最终可见 assistant 全文。
+
+    resume_without_duplicate_human=True 仅给 stream 失败后的降级：避免 Redis 已有 Human 再写一遍。
+    """
+    text = _validate_run_args(thread_id, last_user_text)
 
     agent = build_agent(db, current_user, last_user_text=text)
-    config = {
-        "configurable": {"thread_id": thread_id.strip()},
-        "recursion_limit": 10,
-    }
+    config = _graph_config(thread_id)
+    existing = _load_checkpoint_messages(agent, config)
+    has_checkpoint = bool(existing)
+
+    if (
+        resume_without_duplicate_human
+        and has_checkpoint
+        and human_already_in_checkpoint(existing, text)
+    ):
+        return _resume_without_new_human(agent, config, existing)
+
+    input_messages = build_input_messages(
+        has_checkpoint=has_checkpoint,
+        last_user_text=text,
+        prior_messages=prior_messages,
+    )
+    result = _invoke_graph(agent, {"messages": input_messages}, config)
+    return _extract_assistant_text((result or {}).get("messages") or [])
+
+
+def stream_agent(
+    db: Session,
+    current_user: User,
+    *,
+    thread_id: str,
+    last_user_text: str,
+    prior_messages: list | None = None,
+):
+    """SSE 用：按 token yield 可见文本；冷暖启动与 run_agent 相同（checkpoint / MySQL prior）。
+
+    stream_mode=messages 产出 (chunk, metadata)；只把 visible_assistant_delta 非空的片段交给生成器打 delta。
+    """
+    text = _validate_run_args(thread_id, last_user_text)
+
+    agent = build_agent(db, current_user, last_user_text=text)
+    config = _graph_config(thread_id)
+    existing = _load_checkpoint_messages(agent, config)
+    has_checkpoint = bool(existing)
+    input_messages = build_input_messages(
+        has_checkpoint=has_checkpoint,
+        last_user_text=text,
+        prior_messages=prior_messages,
+    )
 
     try:
-        state = agent.get_state(config)
-        has_checkpoint = bool((state.values or {}).get("messages"))
-    except BusinessException:
-        raise
-    except Exception:
-        raise BusinessException(message=_REDIS_UNAVAILABLE)
-
-    if has_checkpoint:
-        input_messages: list[BaseMessage] = [HumanMessage(content=text)]
-    else:
-        prior = _prior_to_langchain(prior_messages or [])
-        input_messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            *prior,
-            HumanMessage(content=text),
-        ]
-
-    try:
-        result = agent.invoke({"messages": input_messages}, config=config)
+        stream = agent.stream(
+            {"messages": input_messages},
+            config=config,
+            stream_mode="messages",
+        )
+        for item in stream:
+            # LangGraph messages 模式多为 (AIMessageChunk, metadata)
+            if isinstance(item, tuple) and len(item) >= 1:
+                chunk = item[0]
+            else:
+                chunk = item
+            piece = visible_assistant_delta(chunk)
+            if piece:
+                yield piece
     except BusinessException:
         raise
     except Exception as exc:
-        # Redis / 网络类优先友好提示
-        name = type(exc).__module__ + "." + type(exc).__name__
-        if "redis" in name.lower() or "Redis" in type(exc).__name__:
-            raise BusinessException(message=_REDIS_UNAVAILABLE)
-        raise BusinessException(message="大模型调用失败，请稍后重试")
-
-    return _extract_assistant_text(result.get("messages") or [])
+        raise map_agent_exception(exc)

@@ -51,7 +51,7 @@
                     :class="item.role === 'user' ? 'is-user' : 'is-assistant'">
                     <div class="msg-bubble" v-html="parseMarkdown(item.content)"></div>
                 </div>
-                <div v-if="loading && messages.length && messages[messages.length - 1].role === 'user'"
+                <div v-if="loading && !streamingAssistant && messages.length && messages[messages.length - 1].role === 'user'"
                     class="msg-row is-assistant">
                     <div class="msg-bubble typing">
                         <span></span><span></span><span></span>
@@ -65,14 +65,16 @@
                         placeholder="问问实验室怎么预约、开放时间" @keydown.enter.exact.prevent="handleSend"
                         @keydown.enter.shift.stop />
                     <div class="composer-toolbar">
-                        <button type="button" class="send-btn" :class="{ ready: canSend }" :disabled="!canSend"
-                            title="发送" @click="handleSend">
-                            <el-icon v-if="!loading" :size="18">
+                        <span v-if="loading" class="composer-hint">停止后后端可能仍跑完</span>
+                        <button v-if="!loading" type="button" class="send-btn" :class="{ ready: canSend }"
+                            :disabled="!canSend" title="发送" @click="handleSend">
+                            <el-icon :size="18">
                                 <Top />
                             </el-icon>
-                            <el-icon v-else class="is-loading" :size="18">
-                                <Loading />
-                            </el-icon>
+                        </button>
+                        <button v-else type="button" class="send-btn ready" title="停止生成（停止后后端可能仍跑完）"
+                            @click="handleStop">
+                            <span class="stop-icon"></span>
                         </button>
                     </div>
                 </div>
@@ -83,7 +85,7 @@
 
 <script setup>
 import {
-    chatApi,
+    chatStreamApi,
     listSessionsApi,
     getSessionMessagesApi,
     deleteSessionApi,
@@ -91,7 +93,7 @@ import {
 } from '@/api/ai'
 import { ref, nextTick, onMounted, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, EditPen, ChatDotRound, Top, Loading } from '@element-plus/icons-vue'
+import { Delete, EditPen, ChatDotRound, Top } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 
@@ -108,7 +110,10 @@ const listRef = ref()
 const threadId = ref(null)
 const sessions = ref([])
 const sessionsLoading = ref(false)
+const streamingAssistant = ref(false) // 已有首个 delta 后关掉 typing 三点
 let loadToken = 0
+let abortController = null // 停止生成：只 abort 读流
+let markdownRaf = 0 // 流式 Markdown 节流，避免每 token 全量 parse
 
 const canSend = computed(() => !!input.value.trim() && !loading.value)
 
@@ -223,33 +228,104 @@ const handleDeleteSession = async (item) => {
     }
 }
 
-/** 发送用户消息并追加助手回复（可带 thread_id） */
+/** 停止读 SSE（abort 不取消后端 LLM / 工具，预约等副作用可能已发生） */
+const handleStop = () => {
+    abortController?.abort()
+}
+
+/** 主路径走 /chat/stream：乐观插入 user，按 delta 涨气泡，done 后校正并刷新侧栏 */
 const handleSend = async () => {
     const text = input.value.trim()
     if (!text || loading.value) return
     messages.value.push({ role: 'user', content: text })
     input.value = ''
     loading.value = true
+    streamingAssistant.value = false
     scrollToBottom()
+    abortController = new AbortController()
+    let assistantIndex = -1
+    let assembled = ''
+    /** 把内存里拼好的字刷到当前 assistant 气泡（配合 rAF 节流） */
+    const flushAssistant = () => {
+        markdownRaf = 0
+        if (assistantIndex >= 0) {
+            messages.value[assistantIndex].content = assembled
+            scrollToBottom()
+        }
+    }
+    /** 收到一块 delta.content：首包建气泡，之后追加 */
+    const applyDelta = (piece) => {
+        if (!piece) return
+        assembled += piece
+        if (assistantIndex < 0) {
+            streamingAssistant.value = true
+            messages.value.push({ role: 'assistant', content: assembled })
+            assistantIndex = messages.value.length - 1
+            scrollToBottom()
+            return
+        }
+        if (!markdownRaf) {
+            markdownRaf = requestAnimationFrame(flushAssistant)
+        }
+    }
     try {
         const payload = {
             messages: [{ role: 'user', content: text }],
             thread_id: threadId.value || null
         }
-        const res = await chatApi(payload)
-        if (res.code === 200 && res.data) {
-            if (res.data.thread_id) {
-                threadId.value = res.data.thread_id
+        await chatStreamApi(payload, {
+            signal: abortController.signal,
+            onMeta: (data) => {
+                if (data?.thread_id) threadId.value = data.thread_id
+            },
+            onDelta: (data) => applyDelta(data?.content || ''),
+            onDone: async (data) => {
+                if (data?.thread_id) threadId.value = data.thread_id
+                const full = data?.content || assembled
+                assembled = full
+                if (assistantIndex < 0 && full) {
+                    messages.value.push({ role: data?.role || 'assistant', content: full })
+                    assistantIndex = messages.value.length - 1
+                } else if (assistantIndex >= 0) {
+                    messages.value[assistantIndex].content = full
+                }
+                scrollToBottom()
+                await refreshSessions()
+            },
+            onError: async (err) => {
+                ElMessage.error(err?.message || '大模型调用失败，请稍后重试')
+                if (!threadId.value) return
+                try {
+                    const res = await getSessionMessagesApi(threadId.value)
+                    if (res?.code === 200 && Array.isArray(res.data) && res.data.length) {
+                        const list = res.data.map((m) => ({
+                            role: m.role,
+                            content: m.content
+                        }))
+                        const last = list[list.length - 1]
+                        if (last?.role === 'assistant' && last.content) {
+                            messages.value = list
+                        }
+                    }
+                } catch {
+                    // 中断/失败时 MySQL 可能仍无 assistant，保留当前半截气泡
+                }
             }
-            messages.value.push({
-                role: res.data.role || 'assistant',
-                content: res.data.content || ''
-            })
-            scrollToBottom()
-            await refreshSessions()
+        })
+    } catch (err) {
+        // 用户点停止会 AbortError，不当成网络故障
+        if (err?.name !== 'AbortError') {
+            ElMessage.error(err?.message || '网络异常，请检查后端服务')
         }
     } finally {
+        if (markdownRaf) {
+            cancelAnimationFrame(markdownRaf)
+            markdownRaf = 0
+            flushAssistant()
+        }
         loading.value = false
+        streamingAssistant.value = false
+        abortController = null
     }
 }
 
@@ -676,14 +752,12 @@ onMounted(async () => {
     opacity: 0.72;
 }
 
-.send-btn .is-loading {
-    animation: send-spin 0.8s linear infinite;
-}
-
-@keyframes send-spin {
-    to {
-        transform: rotate(360deg);
-    }
+.stop-icon {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    background: #fff;
+    display: block;
 }
 
 @media (max-width: 768px) {
