@@ -1,7 +1,0 @@
-# 语言统计（安全）
-*.py linguist-language=Python
-*.vue linguist-language=Vue
-
-# 排除生成物统计（安全）
-package-lock.json linguist-generated=true
-dist/** linguist-generated=true
