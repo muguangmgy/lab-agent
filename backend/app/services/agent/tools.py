@@ -40,7 +40,7 @@ def _err(error: str) -> str:
 
 class SearchLabDocsInput(BaseModel):
     query: str = Field(
-        description="检索内容，优先用用户原话或关键词，如预约规则、开放时间、安全规范"
+        description="检索用的问句，尽量用用户原话，例如：审核没过能进实验室吗"
     )
 
 
@@ -76,9 +76,10 @@ def build_tools(db: Session, current_user: User, last_user_text: str = ""):
 
     @tool(args_schema=SearchLabDocsInput)
     def search_lab_docs(query: str) -> str:
-        """检索实验室知识库（预约规则、开放时间、安全规范、设备使用说明等）。
+        """检索实验室制度文档（预约规则、安全规范、设备使用说明、各类型实验室开放时间政策）。
 
-        用户询问规则、制度、开放时间、安全要求时优先调用；不要凭空编造。
+        问规则、能不能进、怎么取消、安全要求、某类实验室周末是否开放时调用。
+        查当前有哪些实验室、某间的设备、要预约时，用 list_open_labs / list_lab_equipments，不要用本工具。
         """
         try:
             content = kb_service.search(query)

@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str
     # Redis（LangGraph Checkpointer）
     REDIS_URL: str = "redis://127.0.0.1:6379"
+    # 知识库 md 与 Chroma 持久化目录（相对路径相对 backend 根目录）
+    KB_DIR: str = "data/kb"
+    CHROMA_DIR: str = "data/chroma"
 
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env", env_file_encoding="utf-8"
@@ -26,6 +29,14 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def resolve_data_path(value: str) -> Path:
+    """环境变量里的目录：绝对路径原样用，相对路径接到 backend 根目录。"""
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (BASE_DIR / path).resolve()
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 UPLOAD_DIR = BASE_DIR / "uploads"

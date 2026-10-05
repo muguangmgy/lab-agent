@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
     try:
         await asyncio.to_thread(kb_service.warmup)
     except Exception:
-        logger.exception("向量库预热失败，服务继续启动")
+        logger.exception("向量库预热失败，知识库检索可能不可用，服务继续启动")
     # Redis Checkpointer：连不上 / setup 失败则阻止启动（勿静默降级）
     await asyncio.to_thread(agent_checkpointer.init_checkpointer, settings.REDIS_URL)
     # 启动项目开启异步的扫描任务

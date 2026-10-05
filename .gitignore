@@ -25,6 +25,10 @@ coverage/
 # Local design docs (not published with the repo)
 docs/
 
+# Local scratch (not published with the repo)
+tests/
+scripts/
+
 # IDE / editor / Cursor
 .idea/
 .vscode/
