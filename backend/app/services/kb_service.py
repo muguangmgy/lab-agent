@@ -1,4 +1,4 @@
-"""实验室知识库：Markdown 切块入库 + Chroma 余弦检索。"""
+"""实验室知识库：文件路由向量 + ## 小节，embedding 仅标题+正文核心。"""
 
 from __future__ import annotations
 
@@ -18,22 +18,31 @@ KB_DIR = resolve_data_path(settings.KB_DIR)
 CHROMA_DIR = resolve_data_path(settings.CHROMA_DIR)
 COLLECTION_NAME = "lab_kb"
 
-# 单块最大字符数；超出才按长度再切
-CHUNK_MAX_CHARS = 700
-# 长度切块时与上一块重叠的字符数，减轻句子被切断
-CHUNK_OVERLAP = 80
-# 向量召回条数（先多捞）
+# 向量召回条数（文件锁不上时的兜底）
 SEARCH_CANDIDATES = 8
-# 实际拼给 Agent 的条数（再精选）
-SEARCH_RETURN = 4
 # 低于该余弦相似度的候选丢掉；cosine 距离 ≈ 1 - 相似度
 MIN_SIMILARITY = 0.28
+# 文件路由向量过线才锁定手册
+FILE_MIN_SIMILARITY = 0.36
+# 小节向量相对 top1 的保留比例（弱词面命中时用来补同文件相关节）
+SECTION_RELATIVE = 0.88
+# 小节标题命中长度达到该值则只按词面选节，不再用向量扩节
+LEX_STRONG = 4
+# 入库格式：文件路由向量 + ## 小节；对不上则整库重建
+INDEX_SCHEMA = "v4-file-section"
 
-# 在 # / ## / ### 标题前切开，标题本身留在下一块开头
-_HEADING_SPLIT = re.compile(r"(?=^#{1,3}\s)", re.MULTILINE)
+# 只在二级标题前切开（一级开篇不入库）
+_H2_SPLIT = re.compile(r"(?=^##\s+)", re.MULTILINE)
+_H1_LINE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+_H2_LINE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
+_DOC_TYPE = re.compile(r"^[^（(]+")
+# 「本文只说明」「本条只讲」等元描述整句
+_META_SENT = re.compile(
+    r"[^。\n]*(?:本文只说明|本条只讲|本条只给|本条只约束)[^。\n]*。?"
+)
 
-_collection: Collection | None = None
-_embedding_fn = None
+_collection: Collection | None = None  # 进程内缓存的 lab_kb 集合
+_embedding_fn = None  # 进程内缓存的 Embedding 客户端
 
 
 def _normalize_embedding_base_url(url: str) -> str:
@@ -53,7 +62,7 @@ def _normalize_embedding_base_url(url: str) -> str:
 
 
 def get_embedding_fn():
-    """返回 Chroma 使用的 Embedding 函数（懒加载，进程内只创建一次）。"""
+    """返回 Chroma 用的 Embedding 函数（按 .env 的 EMBEDDING_* 创建，进程内只建一次）。"""
     global _embedding_fn
     if _embedding_fn is not None:
         return _embedding_fn
@@ -83,51 +92,46 @@ def _kb_fingerprint() -> str:
     return hasher.hexdigest()[:16]
 
 
-def _split_by_length(text: str) -> list[str]:
-    """把超长文本按 CHUNK_MAX_CHARS 切开，优先在换行处断开，块之间保留重叠。"""
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= CHUNK_MAX_CHARS:
-        return [text]
-    chunks: list[str] = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + CHUNK_MAX_CHARS, n)
-        piece = text[start:end]
-        if end < n:
-            nl = piece.rfind("\n")
-            if nl >= CHUNK_MAX_CHARS // 2:
-                end = start + nl
-                piece = text[start:end]
-        piece = piece.strip()
-        if piece:
-            chunks.append(piece)
-        if end >= n:
-            break
-        start = max(end - CHUNK_OVERLAP, start + 1)
-    return chunks
+def _strip_meta(text: str) -> str:
+    """去掉「本文只说明」「本条只讲」一类元描述，只留规定正文。"""
+    cleaned = _META_SENT.sub("", text or "")
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
-def _split_markdown(text: str) -> list[str]:
-    """按 Markdown 一到三级标题切块；单块仍超长时再交给 _split_by_length。"""
-    text = (text or "").strip()
-    if not text:
-        return []
-    headings = [p.strip() for p in _HEADING_SPLIT.split(text) if p.strip()]
-    parts = headings or [text]
-    chunks: list[str] = []
-    for part in parts:
-        chunks.extend(_split_by_length(part))
-    return chunks
+def _doc_type_from_h1(raw: str, fallback: str) -> str:
+    """从一级标题取出文档主题（括号前的文字）。
+
+    例如「# 安全规范（着装…）」得到「安全规范」。没有一级标题时用 fallback（一般为文件名）。
+    """
+    match = _H1_LINE.search(raw or "")
+    if not match:
+        return fallback
+    title = match.group(1).strip()
+    typed = _DOC_TYPE.match(title)
+    return (typed.group(0).strip() if typed else title) or fallback
+
+
+def _section_from_h2(heading: str, doc_type: str) -> str:
+    """从二级标题取出小节名。
+
+    「安全规范·实验服与护目镜」且前缀等于 doc_type 时只留「实验服与护目镜」；
+    没有间隔号、或前缀对不上时返回整段标题。
+    """
+    heading = (heading or "").strip()
+    if "·" in heading:
+        left, right = heading.split("·", 1)
+        if left.strip() == doc_type:
+            return right.strip() or heading
+        return heading
+    return heading
 
 
 def _load_chunks() -> tuple[list[str], list[str], list[dict]]:
-    """读取 data/kb/*.md 并切块。
+    """扫描 data/kb/*.md，生成可交给 Chroma add() 的 (ids, documents, metadatas)。
 
-    返回 (ids, documents, metadatas)，与 Chroma add() 对齐。
-    每条 document 前会加上「来源：文件名」，id 形如 预约规则#0。
+    每个 md 先写一条 level=file：document 为「主题 + 顿号连接的各节标题」，用于宽问锁手册。
+    再为每个 ## 写一条 level=section：document 为「主题·小节 + 去掉元描述后的正文」。
+    id 形如 预约规则#file、预约规则#0。
     """
     ids: list[str] = []
     docs: list[str] = []
@@ -136,16 +140,44 @@ def _load_chunks() -> tuple[list[str], list[str], list[dict]]:
         raw = path.read_text(encoding="utf-8").strip()
         if not raw:
             continue
-        pieces = _split_markdown(raw)
-        for index, piece in enumerate(pieces):
-            body = f"来源：{path.name}\n{piece}"
+        doc_type = _doc_type_from_h1(raw, path.stem)
+        parts = [p.strip() for p in _H2_SPLIT.split(raw) if p.strip().startswith("##")]
+        sections: list[tuple[str, str]] = []
+        for part in parts:
+            heading_match = _H2_LINE.search(part)
+            heading = heading_match.group(1).strip() if heading_match else ""
+            section = _section_from_h2(heading, doc_type)
+            body = _strip_meta(_H2_LINE.sub("", part, count=1))
+            if not body:
+                continue
+            sections.append((section, body))
+        if not sections:
+            continue
+        section_count = len(sections)
+        # 文件路由向量：只含手册名和各节标题，不把开篇元描述写进 embedding
+        ids.append(f"{path.stem}#file")
+        docs.append(f"{doc_type}\n" + "、".join(s for s, _ in sections))
+        metas.append(
+            {
+                "level": "file",
+                "source": path.name,
+                "doc_type": doc_type,
+                "section": "",
+                "chunk": -1,
+                "section_count": section_count,
+            }
+        )
+        for index, (section, body) in enumerate(sections):
             ids.append(f"{path.stem}#{index}")
-            docs.append(body)
+            docs.append(f"{doc_type}·{section}\n{body}")
             metas.append(
                 {
+                    "level": "section",
                     "source": path.name,
+                    "doc_type": doc_type,
+                    "section": section,
                     "chunk": index,
-                    "title": path.stem,
+                    "section_count": section_count,
                 }
             )
     return ids, docs, metas
@@ -154,12 +186,14 @@ def _load_chunks() -> tuple[list[str], list[str], list[dict]]:
 def _needs_rebuild(col: Collection, fingerprint: str) -> bool:
     """判断现有集合是否要删掉重建。
 
-    空集合、距离空间不是 cosine、或 md 指纹与入库时不一致，都需要重建。
+    空集合、距离空间不是 cosine、入库格式版本不一致、或 md 指纹与入库时不一致，都需要重建。
     """
     meta = col.metadata or {}
     if col.count() == 0:
         return True
     if meta.get("hnsw:space") != "cosine":
+        return True
+    if meta.get("kb_schema") != INDEX_SCHEMA:
         return True
     if meta.get("kb_fingerprint") != fingerprint:
         return True
@@ -167,7 +201,10 @@ def _needs_rebuild(col: Collection, fingerprint: str) -> bool:
 
 
 def get_collection() -> Collection:
-    """拿到可用的 lab_kb 集合；进程内缓存，必要时按当前 md 整库重建。"""
+    """返回可用的 lab_kb 集合（进程内缓存）。
+
+    集合不存在、为空、距离不是 cosine、kb_schema 或 md 指纹与当前不一致时，删除后按 _load_chunks 重建。
+    """
     global _collection
     if _collection is not None:
         return _collection
@@ -198,13 +235,21 @@ def get_collection() -> Collection:
     col = client.create_collection(
         name=COLLECTION_NAME,
         embedding_function=embedding_fn,
-        metadata={"hnsw:space": "cosine", "kb_fingerprint": fingerprint},
+        metadata={
+            "hnsw:space": "cosine",
+            "kb_fingerprint": fingerprint,
+            "kb_schema": INDEX_SCHEMA,
+        },
     )
     ids, docs, metas = _load_chunks()
     if docs:
         col.add(ids=ids, documents=docs, metadatas=metas)
         sources = {m["source"] for m in metas}
-        logger.info("向量库入库完成：%s 个切片 / %s 个 md", len(docs), len(sources))
+        logger.info(
+            "向量库入库完成：%s 个切片 / %s 个 md（含文件路由向量）",
+            len(docs),
+            len(sources),
+        )
     else:
         logger.warning("知识库目录没有可入库的 md：%s", KB_DIR)
 
@@ -217,53 +262,240 @@ def _similarity(distance: float) -> float:
     return max(0.0, min(1.0, 1.0 - float(distance)))
 
 
-def search(query: str) -> str:
-    """按用户问题做向量检索，返回拼给 Agent 的文本。
+def _unpack_query(res: dict) -> list[dict]:
+    """把 Chroma query 的 documents/metadatas/distances 收成带 score 的命中列表。"""
+    docs = (res.get("documents") or [[]])[0]
+    metadatas = (res.get("metadatas") or [[]])[0]
+    distances = (res.get("distances") or [[]])[0]
+    rows: list[dict] = []
+    for doc, meta, dist in zip(docs, metadatas, distances):
+        if not doc:
+            continue
+        meta = meta or {}
+        rows.append(
+            {
+                "score": _similarity(dist),
+                "source": meta.get("source") or "",
+                "doc_type": meta.get("doc_type") or "",
+                "section": meta.get("section") or "",
+                "chunk": int(meta.get("chunk") or 0),
+                "level": meta.get("level") or "",
+                "content": doc,
+            }
+        )
+    return rows
 
-    流程：问题 embedding → 召回最多 SEARCH_CANDIDATES 条 → 过滤低相似度与重复
-    → 按分数取 SEARCH_RETURN 条 → 用 --- 拼接。未命中返回空字符串。
+
+def _format_sections(source: str, rows: list[dict]) -> str:
+    """把同一 md 的小节按 chunk 顺序拼成给 Agent 的文本，开头带 [文件名]。"""
+    ordered = sorted(rows, key=lambda x: x["chunk"])
+    body = "\n\n".join(item["content"] for item in ordered)
+    return f"[{source or '知识库'}]\n{body}"
+
+
+def _section_lexical(query: str, section: str) -> int:
+    """计算问句与小节标题的最长字面命中长度，用于判断问的是哪一节。
+
+    会用完整标题、去掉「实验室」的前缀、以及 2～6 字片段去匹配；
+    标题含「占用」且问句像「占不占」时额外记一次占用命中。未命中返回 0。
+    """
+    if not query or not section:
+        return 0
+    needles = [section]
+    if section.endswith("实验室") and len(section) > 3:
+        needles.append(section[: -len("实验室")])
+    max_n = min(6, len(section))
+    for n in range(2, max_n + 1):
+        for i in range(0, len(section) - n + 1):
+            gram = section[i : i + n]
+            if gram != "实验室":
+                needles.append(gram)
+    if "占用" in section and ("占用" in query or "占不占" in query or "占实验室" in query):
+        needles.append("占用")
+    best = 0
+    for token in needles:
+        if token in query:
+            best = max(best, len(token))
+    return best
+
+
+def _list_file_docs(col: Collection) -> list[dict]:
+    """取出集合里全部 level=file 记录的 source 与 doc_type，供标题路由使用。"""
+    got = col.get(where={"level": "file"}, include=["metadatas"])
+    rows: list[dict] = []
+    for meta in got.get("metadatas") or []:
+        if not meta:
+            continue
+        rows.append(
+            {
+                "source": meta.get("source") or "",
+                "doc_type": meta.get("doc_type") or "",
+            }
+        )
+    return rows
+
+
+def _route_source(col: Collection, query: str) -> str | None:
+    """锁定问句对应的 md 文件名。
+
+    问句里唯一（或最长词更长）命中某个 doc_type 则直接用该文件；
+    多份打平或标题对不上时，用 level=file 向量取过 FILE_MIN_SIMILARITY 的 top1。
+    仍没有则返回 None，由 search 再走小节向量兜底。
+    """
+    files = _list_file_docs(col)
+    if not files:
+        return None
+    typed = []
+    for item in files:
+        doc_type = item["doc_type"]
+        if doc_type and doc_type in query:
+            typed.append((len(doc_type), item["source"]))
+    if typed:
+        typed.sort(key=lambda x: x[0], reverse=True)
+        # 最长 doc_type 唯一领先才用标题锁定，避免「预约」这类词同时命中多份
+        if len(typed) == 1 or typed[0][0] > typed[1][0]:
+            logger.info("kb 文件路由 via=title source=%s", typed[0][1])
+            return typed[0][1]
+
+    limit = min(len(files), 8)
+    res = col.query(query_texts=[query], n_results=limit, where={"level": "file"})
+    ranked = [row for row in _unpack_query(res) if row["score"] >= FILE_MIN_SIMILARITY]
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+    if not ranked:
+        return None
+    logger.info(
+        "kb 文件路由 via=vector source=%s score=%.3f",
+        ranked[0]["source"],
+        ranked[0]["score"],
+    )
+    return ranked[0]["source"] or None
+
+
+def _sections_of(col: Collection, source: str) -> list[dict]:
+    """取出指定 md 的全部 level=section 切片，按 chunk 升序，score 先置 0。"""
+    got = col.get(
+        where={"$and": [{"level": "section"}, {"source": source}]},
+        include=["documents", "metadatas"],
+    )
+    rows: list[dict] = []
+    for doc, meta in zip(got.get("documents") or [], got.get("metadatas") or []):
+        if not doc:
+            continue
+        meta = meta or {}
+        rows.append(
+            {
+                "score": 0.0,
+                "source": meta.get("source") or source,
+                "doc_type": meta.get("doc_type") or "",
+                "section": meta.get("section") or "",
+                "chunk": int(meta.get("chunk") or 0),
+                "level": "section",
+                "content": doc,
+            }
+        )
+    rows.sort(key=lambda x: x["chunk"])
+    return rows
+
+
+def _attach_section_scores(col: Collection, query: str, source: str, rows: list[dict]) -> None:
+    """在该 md 的小节子集上做向量检索，把相似度写回 rows 的 score（按 chunk 对齐）。"""
+    if not rows:
+        return
+    res = col.query(
+        query_texts=[query],
+        n_results=len(rows),
+        where={"$and": [{"level": "section"}, {"source": source}]},
+    )
+    by_chunk = {row["chunk"]: row for row in rows}
+    for hit in _unpack_query(res):
+        item = by_chunk.get(hit["chunk"])
+        if item is not None:
+            item["score"] = hit["score"]
+
+
+def _pick_sections(query: str, rows: list[dict]) -> list[dict]:
+    """在已锁定的文件内挑选要返回的小节。
+
+    小节标题都对不上问句：视为宽问，返回该文件全部小节。
+    标题命中达到 LEX_STRONG：只留词面相对最高的那些节。
+    命中较弱：再并入向量分接近 top1 的同文件小节（如显微镜问占用）。
+    """
+    if not rows:
+        return []
+    lex = [( _section_lexical(query, row["section"]), row) for row in rows]
+    max_lex = max(score for score, _ in lex)
+    if max_lex <= 0:
+        # 只命中手册名、对不上任何 ##：返回该文件全部小节
+        return rows
+
+    kept: dict[int, dict] = {}
+    for score, row in lex:
+        if score > 0 and score >= max_lex * 0.85:
+            kept[row["chunk"]] = row
+
+    # 词面不够强时（如「显微镜」只有 3 字）再用向量把占用等相邻节补进来
+    if max_lex < LEX_STRONG:
+        top_vec = max((row["score"] for row in rows), default=0.0)
+        if top_vec >= MIN_SIMILARITY:
+            for row in rows:
+                if row["score"] >= top_vec * SECTION_RELATIVE:
+                    kept[row["chunk"]] = row
+
+    if not kept:
+        return rows
+    return sorted(kept.values(), key=lambda x: x["chunk"])
+
+
+def search(query: str) -> str:
+    """先用文件向量/标题锁定 md，再在该文件小节里决定全文或若干节。
+
+    宽问（只命中手册名）返回该文件全部小节；窄问返回命中的小节。
+    文件锁不上时用小节向量 top1 的 source 再走同样逻辑。未命中返回空字符串。
     """
     q = (query or "").strip()
     if not q:
         return ""
     col = get_collection()
-    total = col.count()
-    if total == 0:
+    if col.count() == 0:
         logger.warning("向量库为空，无法检索")
         return ""
 
-    limit = min(SEARCH_CANDIDATES, total)
-    res = col.query(query_texts=[q], n_results=limit)
-    docs = (res.get("documents") or [[]])[0]
-    metadatas = (res.get("metadatas") or [[]])[0]
-    distances = (res.get("distances") or [[]])[0]
+    source = _route_source(col, q)
+    if not source:
+        # 标题和文件向量都锁不上：用小节近邻的 top1 文件再走选节
+        limit = min(SEARCH_CANDIDATES, col.count())
+        fallback = [
+            row
+            for row in _unpack_query(
+                col.query(
+                    query_texts=[q],
+                    n_results=limit,
+                    where={"level": "section"},
+                )
+            )
+            if row["score"] >= MIN_SIMILARITY
+        ]
+        fallback.sort(key=lambda x: x["score"], reverse=True)
+        if not fallback:
+            return ""
+        source = fallback[0]["source"]
+        logger.info("kb 文件路由 via=section-fallback source=%s", source)
 
-    scored: list[dict] = []
-    seen: set[str] = set()
-    for doc, meta, dist in zip(docs, metadatas, distances):
-        if not doc:
-            continue
-        score = _similarity(dist)
-        if score < MIN_SIMILARITY:
-            continue
-        source = (meta or {}).get("source") or ""
-        key = f"{source}\n{doc}"
-        if key in seen:
-            continue
-        seen.add(key)
-        scored.append({"score": score, "source": source, "content": doc})
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    picked = scored[:SEARCH_RETURN]
-    if not picked:
+    rows = _sections_of(col, source)
+    if not rows:
         return ""
-
-    parts = [f"[{item['source'] or '知识库'}]\n{item['content']}" for item in picked]
-    return "\n\n---\n\n".join(parts)
+    _attach_section_scores(col, q, source, rows)
+    picked = _pick_sections(q, rows)
+    logger.info(
+        "kb 命中 source=%s sections=%s",
+        source,
+        [item["section"] for item in picked],
+    )
+    return _format_sections(source, picked)
 
 
 def warmup() -> None:
-    """启动时预热：加载 embedding、按需重建索引，并跑一次检索避免首问超时。"""
+    """启动时加载 embedding、必要时重建索引，并打一次 query，避免首个用户问题卡住。"""
     col = get_collection()
     if col.count() > 0:
         col.query(query_texts=["实验室预约规则"], n_results=1)
