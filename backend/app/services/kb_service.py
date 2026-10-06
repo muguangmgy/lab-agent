@@ -45,22 +45,6 @@ _collection: Collection | None = None  # 进程内缓存的 lab_kb 集合
 _embedding_fn = None  # 进程内缓存的 Embedding 客户端
 
 
-def _normalize_embedding_base_url(url: str) -> str:
-    """规范化 Embedding 的 API 根地址。
-
-    OpenAI 兼容客户端会自己拼接 /embeddings，base 应停在 /v1。
-    若配置误写成完整 embeddings URL，去掉末尾路径并告警。
-    """
-    raw = (url or "").strip().rstrip("/")
-    if raw.endswith("/embeddings"):
-        raw = raw[: -len("/embeddings")].rstrip("/")
-        logger.warning(
-            "EMBEDDING_BASE_URL 含 /embeddings，已纠正为 %s（客户端会自动追加该路径）",
-            raw,
-        )
-    return raw
-
-
 def get_embedding_fn():
     """返回 Chroma 用的 Embedding 函数（按 .env 的 EMBEDDING_* 创建，进程内只建一次）。"""
     global _embedding_fn
@@ -68,7 +52,7 @@ def get_embedding_fn():
         return _embedding_fn
     _embedding_fn = embedding_functions.OpenAIEmbeddingFunction(
         api_key=settings.EMBEDDING_API_KEY,
-        api_base=_normalize_embedding_base_url(settings.EMBEDDING_BASE_URL),
+        api_base=settings.EMBEDDING_BASE_URL,
         model_name=settings.EMBEDDING_MODEL,
     )
     return _embedding_fn
